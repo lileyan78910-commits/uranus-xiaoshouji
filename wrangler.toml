@@ -1,0 +1,44 @@
+name = "uranus-xiaoshouji"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[observability]
+enabled = true
+
+# 所有数据（配置、会话、记忆……）都在这一个 Durable Object 里
+[[durable_objects.bindings]]
+name = "URANUS"
+class_name = "Uranus"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Uranus"]
+
+# 桌面版代码原样复用，靠这里把 Node 专属的东西换掉
+[alias]
+"node:fs" = "./src/shims/fs.js"
+"fs" = "./src/shims/fs.js"
+"node:url" = "./src/shims/url.js"
+"@napi-rs/canvas" = "./src/shims/stub.js"
+"ffmpeg-static" = "./src/shims/stub.js"
+"@spectrum-ts/imessage-local" = "./src/shims/stub.js"
+# Photon SDK 的传输层换成 grpc-web（见 shims/nice-grpc.js），其余 SDK 原样用
+# 收消息改走 webhook（见 shims/spectrum.js），其余照转官方 SDK
+"spectrum-ts" = "./src/shims/spectrum.js"
+# 发语音条时 caf 原样放行，不去找 ffmpeg 转 m4a（见 shims/authoring.js）
+"@spectrum-ts/core/authoring" = "./src/shims/authoring.js"
+"nice-grpc" = "./src/shims/nice-grpc.js"
+"nice-grpc-common" = "./src/shims/nice-grpc.js"
+"@grpc/grpc-js" = "./src/shims/stub.js"
+"iconv-lite" = "./src/shims/iconv-lite.js"
+"nodemailer" = "./src/shims/stub.js"
+"tar-fs" = "./src/shims/tar-fs.js"
+"mammoth" = "./src/shims/stub.js"
+"pdf-parse" = "./src/shims/stub.js"
+
+# 角色过日子用的时区（提示词里的「现在几点」、定时日记、主动消息都按它）。
+# Worker 本身永远是 UTC，这里改成你自己的，比如 America/Los_Angeles
+[vars]
+TZ = "United Kingdom/London"

@@ -1,0 +1,6 @@
+.dry/
+*.local.*
+.*.local.*
+node_modules/
+.wrangler/
+.dev.vars

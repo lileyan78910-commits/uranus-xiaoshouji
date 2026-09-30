@@ -1,0 +1,1480 @@
+/**
+ * Instagram 那一轮真正**跑起来**的地方：排队 → 到点 → 掷骰子 → 打模型 → 落盘。
+ *
+ * ── 为什么要排队、而不是当场跑 ──
+ *
+ * 用户发一条帖子，五个开了 IG 的角色不该在同一秒齐刷刷冒出来评论 —— 那看着
+ * 就像机器人。每个角色各自有个等待窗口（默认 30–120 分钟），在窗口里随机挑
+ * 一个时刻，到点才轮到它。窗口跨得比进程寿命长，所以队列**落盘**
+ * （igstore.js:pushQueue），重启接着跑。
+ *
+ * ── 骰子在哪儿掷 ──
+ *
+ * 全部在 `runIgTask` 里、到点那一刻掷，排队那一步一个随机数都不用。这样
+ * 「排了几条任务」是确定的，能离线测；概率这种会变的策略只长在一个地方。
+ *
+ *   likeChance   刷到新帖 / 新快拍时掷。**中了就只点赞、不打模型**
+ *                （config.js 里那行注释定的：一次互动只花一次钱）。
+ *   replyChance  用户来评论时掷。没中就当没看见 —— 不改成「那就点个赞」，
+ *                不然动态列表里会冒出一堆没人要的赞。
+ *
+ * 角色之间的评论（charComment）不掷 replyChance，它由白名单（peerAllowed）
+ * 和线程条数上限（canChain）管着，已经够严了。
+ *
+ * ── 这个文件的边界 ──
+ *
+ * 只 import 叶子模块：config / llm / logs / media / igstore / igprompt /
+ * igtags / instagram / igaccounts。**不认识 runner，也不碰 space** —— 和 proactive.js
+ * 一个路子。上文怎么拿、短信怎么发、这一轮怎么写进记忆库，全由调用方通过
+ * `opts.session` 那个回调提供（真正的实现在 imessage.js，那边才有 sendBubbles
+ * / appendTurn / afterTurn）。搬过来就是循环依赖。
+ */
+
+import fs from "node:fs";
+import path from "node:path";
+
+import { applyVars, resolveImageEndpoint, resolveRoleEndpoints, resolveUser } from "./config.js";
+import { mentionedHandles, readAccounts, roleHandleMap } from "./igaccounts.js";
+import { buildIgPrompt, defaultTemplate } from "./igprompt.js";
+import {
+  DEFAULT_STORY_HOURS,
+  USER_OWNER,
+  activeStories,
+  addActivity,
+  addPost,
+  addStory,
+  dropQueue,
+  dueTasks,
+  mediaPathFor,
+  pruneVisionNotes,
+  pushQueue,
+  readPosts,
+  readQueue,
+  readSettings,
+  readStories,
+  saveMedia,
+  storyExpired,
+  updatePost,
+  updateStory,
+} from "./igstore.js";
+import { hasIgPublishTag, hasImageTag, splitBrowse, splitIg } from "./igtags.js";
+import { canChain, igOwners, peerAllowed, roleFor } from "./instagram.js";
+import { chatWithFallback, describeImage } from "./llm.js";
+import { logDebug, logError, logInfo, logWarn } from "./logs.js";
+import { generateImage, mimeForExt } from "./media.js";
+import { inFocus, msUntilFocusEnd } from "./proactive.js";
+
+const SCOPE = "Instagram";
+
+/* ================= 小工具 ================= */
+
+function roleById(config, id) {
+  const want = String(id ?? "");
+  if (!want) return null;
+  return (config?.roles ?? []).find((r) => String(r?.id ?? "") === want) ?? null;
+}
+
+/** 这个角色现在开着 IG 没有。角色被删了、开关关了，排着的任务就作废。 */
+function igOn(role) {
+  return Boolean(role?.instagram?.enabled);
+}
+
+/**
+ * 这条任务什么时候跑：等待窗口里随机挑一个时刻。
+ *
+ * normalizeInstagram 已经把上下限夹好、反了的换过来了，这里再兜一层是因为
+ * 这个函数也被测试直接调，给它传一份手搓的 role 不该炸。
+ */
+export function delayFor(role, now = Date.now(), roll = Math.random) {
+  const w = role?.instagram?.replyWindow ?? {};
+  const a = Number(w.minMinutes) > 0 ? Number(w.minMinutes) : 30;
+  const b = Number(w.maxMinutes) > 0 ? Number(w.maxMinutes) : 120;
+  const lo = Math.min(a, b);
+  const hi = Math.max(a, b);
+  return now + Math.round((lo + roll() * (hi - lo)) * 60_000);
+}
+
+/** 百分数掷骰子。`chance` 是 0–100 的整数。 */
+function hit(chance, roll) {
+  const c = Number(chance);
+  if (!Number.isFinite(c) || c <= 0) return false;
+  return roll() * 100 < c;
+}
+
+/**
+ * 这条内容的配文里**点名**了这个角色吗（`@它的真 IG 用户名`）。
+ *
+ * ── 为什么点名要影响掷骰子 ──
+ *
+ * 你在配文里 @ 一个角色，意思是「我要它来说话」，不是「请它掷一次骰子」。
+ * 默认 50% 的 `likeChance` 中了就只点个赞、不打模型（runIgTask 里那条规矩），
+ * 也就是说你 @ 完有一半概率只收到一个赞 —— 那不是你要的。
+ *
+ * 所以被点名的角色**跳过点赞那一掷**，直接走到模型。只跳这一掷：白名单、
+ * 快拍过期、线程上限那些闸一个都不动 —— 那几个管的是别的事。
+ *
+ * 只认**已经绑了真号**的角色（`roleHandleMap`）：没绑号的角色没有 IG 用户名，
+ * 配文里那串 @ 指不到它。所以纯本地玩法（一个真号都没绑）行为完全不变。
+ *
+ * 读不到账号文件就当没点名 —— 这个判断只用来放宽概率，失败该退回默认行为。
+ */
+function mentionsRole(item, role) {
+  const caption = String(item?.caption ?? "");
+  if (!caption.includes("@")) return false;
+  const name = String(role?.name ?? "");
+  if (!name) return false;
+  try {
+    const byHandle = roleHandleMap(readAccounts());
+    return mentionedHandles(caption).some((h) => byHandle.get(h) === name);
+  } catch {
+    return false;
+  }
+}
+
+/** 一条评论所在线程的根评论 id（顺着 replyTo 往上走）。 */
+export function rootOf(list, id) {
+  const byId = new Map((list ?? []).map((c) => [c.id, c]));
+  let cur = byId.get(String(id ?? ""));
+  // IG 的评论只有两层，走两步就到头了；给个上限纯粹是防脏数据自己指自己
+  for (let i = 0; i < 8 && cur?.replyTo && byId.has(cur.replyTo); i += 1) {
+    cur = byId.get(cur.replyTo);
+  }
+  return cur?.id ?? String(id ?? "");
+}
+
+/* ================= 排队 ================= */
+
+/**
+ * 谁会刷到 `owner` 发的东西。
+ *
+ * 用户发的：所有开了 IG 的角色都刷得到（用户是主角，不受白名单管）。
+ * 角色发的：只有把它加进自己互动名单的角色刷得到 —— 名单是**单向**的
+ * （instagram.js:peerAllowed 只看行动方自己那份），A 愿意理 B 不代表 B 愿意理 A。
+ */
+export function audienceFor(config, owner) {
+  const roles = (config?.roles ?? []).filter(igOn);
+  if (owner === USER_OWNER) return roles;
+  return roles.filter((r) => String(r?.name ?? "") !== owner && peerAllowed(config, r, owner));
+}
+
+/**
+ * 有人发了新帖 / 新快拍 → 给每个刷得到的角色排一条任务。
+ *
+ * **角色发的快拍不触发任何人**：场景模板里压根没有 charStory 这一条
+ * （igprompt.js:IG_SCENES）。快拍在 IG 上本来就是「看过就算」的东西，
+ * 让角色之间互相追着对方的快拍评论，只会把上下文撑爆。
+ * 角色的快拍靠「定时刷 IG」（runBrowse）被刷到 —— 那一轮一次看一整圈，不是一条快拍叫一次。
+ *
+ * @returns {object[]} 排进去的任务
+ */
+export function schedulePublish(config, owner, item, opts = {}) {
+  const isStory = Boolean(opts.isStory);
+  if (!item?.id) return [];
+  if (isStory && owner !== USER_OWNER) return [];
+
+  const now = Number.isFinite(opts.now) ? opts.now : Date.now();
+  const roll = opts.roll ?? Math.random;
+  const kind = owner === USER_OWNER ? (isStory ? "userStory" : "userPost") : "charPost";
+
+  const out = [];
+  for (const role of audienceFor(config, owner)) {
+    out.push(
+      pushQueue({
+        at: delayFor(role, now, roll),
+        roleId: String(role.id ?? ""),
+        kind,
+        postOwner: owner,
+        postId: isStory ? "" : item.id,
+        storyId: isStory ? item.id : "",
+        commentId: "",
+        chain: 0,
+      })
+    );
+  }
+  return out;
+}
+
+/**
+ * 有人留了条评论 / 回了条快拍 → 给**被说话的那个人**排一条任务。
+ *
+ * 「被说话的那个人」= 回复某条评论时是那条评论的作者，顶层评论时是内容的主人。
+ * 目标是用户就不排 —— 回不回是用户自己的事，轮不到程序替他决定。
+ *
+ * 角色对角色那条还要过两道闸：
+ *   1. 白名单（peerAllowed）：目标角色愿不愿意理行动方。
+ *   2. 线程上限（canChain）：这条线程已经来回够了就打住。上限取**帖主**那份
+ *      设置 —— 一条线程的长短该由地盘的主人定；帖主是用户的话他没有这项设置，
+ *      退回到要说话的那个角色自己的。
+ *
+ * ── `opts.outsider`：真 IG 上的外人 ──
+ *
+ * 说话的既不是用户、也不是本地任何一个角色 —— 那是**真 IG 白名单里的某个人**
+ * （igreal.js:syncCommentsIn 拉回来的评论，owner 是白名单里给它起的显示名）。
+ * 这种要单独放一条路，因为上面那两道闸对它都是错的：
+ *
+ *   · `peerAllowed` 查的是「目标角色的 peers 里有没有行动方**这个角色**」，
+ *     而外人不是角色 —— 查出来永远是 false，等于白名单形同虚设。
+ *     **这是这一条存在的直接原因**：在它之前，白名单里加谁都不会有人回。
+ *   · `canChain` 是防角色之间「变成永动机」的。外人是真人，一句一句手打的，
+ *     没有永动机可言；套上去的效果是真朋友聊两句就被无视。
+ *
+ * 只认调用方明确传进来的 `outsider`，而且**行动方必须真的不是本地角色** ——
+ * 传错了也不能让一个角色绕过 peers 名单。谁是外人由 syncCommentsIn 判断，
+ * 它在那之前已经过了 `allowedFrom` 那道闸：不在白名单里的评论只镜像，压根
+ * 走不到这儿（用户定的「陌生人不要让 LLM 回复」）。
+ */
+export function scheduleComment(config, owner, item, comment, opts = {}) {
+  const isStory = Boolean(opts.isStory);
+  if (!item?.id || !comment?.id) return [];
+
+  const now = Number.isFinite(opts.now) ? opts.now : Date.now();
+  const roll = opts.roll ?? Math.random;
+  const actor = String(comment.owner ?? "");
+  const list = (isStory ? item.replies : item.comments) ?? [];
+
+  const parent = comment.replyTo ? list.find((c) => c.id === comment.replyTo) : null;
+  const targetOwner = parent ? String(parent.owner ?? "") : String(owner ?? "");
+  if (!targetOwner || targetOwner === actor) return []; // 自言自语不触发
+  if (targetOwner === USER_OWNER) return [];
+
+  const role = roleFor(config, targetOwner);
+  if (!igOn(role)) return [];
+
+  const fromUser = actor === USER_OWNER;
+  // 外人：调用方说是，而且这个名字确实不对应任何本地角色（防传错绕过 peers）
+  const fromOutsider = Boolean(opts.outsider) && !fromUser && !roleFor(config, actor);
+
+  if (!fromUser && !fromOutsider) {
+    // 角色之间：快拍底下不接，那儿没有线程结构，数不出来回了几次
+    if (isStory) return [];
+    if (!peerAllowed(config, role, actor)) return [];
+    const max = (roleFor(config, owner) ?? role)?.instagram?.maxChain;
+    if (!canChain(item, rootOf(list, comment.id), max)) return [];
+  }
+
+  return [
+    pushQueue({
+      at: delayFor(role, now, roll),
+      roleId: String(role.id ?? ""),
+      /*
+       * 外人算 `userComment`。
+       *
+       * 那个 kind 决定两件事：走哪条场景模板（igprompt.js），以及**能不能顺带
+       * 发条短信**（runIgTask 里 isPeer 那个判断）。外人更像「有人来跟你说话」
+       * 而不是「另一个角色来跟你说话」：模板里那句「{{user}} 在 Instagram 上给
+       * 你留了言」会被 markFor 换成真正的说话人，而角色为此跟用户提一句
+       * 「刚有人在我帖子下面留言」是合理的 —— 反倒是 charComment 那条规矩
+       * （角色互动一律不发短信）套在真人身上没道理。
+       *
+       * 代价：replyChance 那道概率闸对外人也生效（runIgTask 里 userComment
+       * 分支掷的那次）。这是对的 —— 角色不该雷打不动地回每一条。
+       */
+      kind: fromUser || fromOutsider ? "userComment" : "charComment",
+      postOwner: String(owner ?? ""),
+      postId: isStory ? "" : item.id,
+      storyId: isStory ? item.id : "",
+      commentId: comment.id,
+      chain: Number(opts.chain) || 0,
+    }),
+  ];
+}
+
+/* ================= 私聊那一轮的路由 ================= */
+
+/**
+ * 角色在**私聊**里回的这段话，该不该走 IG 链路。
+ *
+ * `[image:]` 是个两边都认的标签：私聊里它是「给用户发张图」（media.js），
+ * IG 里它是配图。所以判据分两段：
+ *
+ *   - 写了 post / story / comment → 明确是 IG 的事，走。
+ *   - **只有** `[image:]`：角色开着生图就还是私聊发图（老功能，一个字不动）；
+ *     没开生图的话那张图在私聊里本来就会被丢掉（imessage.js:sendImagePart
+ *     直接 return false），这时候按用户定的默认当成「一条没有文字的快拍」
+ *     发到 IG 上 —— 从「丢掉」变成「发出去」，不抢任何已有行为。
+ */
+export function igRouteFor(role, text) {
+  if (!igOn(role)) return false;
+  if (hasIgPublishTag(text)) return true;
+  return hasImageTag(text) && !role?.imageGen?.enabled;
+}
+
+/* ================= 出图 ================= */
+
+/**
+ * 按描述出一张图，存进 data/instagram/media/，返回文件名。
+ *
+ * 出不来就返回空串 —— 调用方会把 `{file:"", alt}` 原样存下去，前端遇到
+ * 没有 file 的图会画成一张「文字图」（把描述写在框里）。用户明确要的降级：
+ * 没配生图模型的人也该能看见帖子长什么样，而不是一片空白。
+ */
+async function renderImage(config, alt) {
+  const desc = String(alt ?? "").trim();
+  if (!desc) return "";
+  const endpoint = resolveImageEndpoint(config);
+  if (!endpoint) {
+    logInfo(SCOPE, `没有可用的生图模型，这张图按文字图处理：${desc}`);
+    return "";
+  }
+  try {
+    const img = await generateImage(endpoint, { prompt: desc }, SCOPE);
+    return saveMedia(img.buffer.toString("base64"), (img.ext ?? "png").replace(/^\./, ""));
+  } catch (e) {
+    logWarn(SCOPE, `这张图没出来，按文字图处理：${desc}`, e);
+    return "";
+  }
+}
+
+/**
+ * 识一次图，结果写回内容本身（`visionNote`）。
+ *
+ * 缓存的理由在 igstore.js 的注释里：五个角色要评论同一张图，识一次够了。
+ * 角色没开识图就直接返回空串 —— 和 imessage.js:describeImages 一样的降级：
+ * 模型看不见图，但配文和 alt 还在，照样能说句话。
+ *
+ * 一条帖子可能有好几张图（轮播），只识第一张有文件的。轮播里后面几张多半是
+ * 同一场景的补充，为它们各花一次钱不划算。
+ */
+async function ensureVisionNote(config, role, owner, item, isStory) {
+  if (item?.visionNote) return item.visionNote;
+
+  const file = isStory ? item?.image?.file : (item?.images ?? []).find((im) => im.file)?.file;
+  if (!file) return "";
+
+  const eps = resolveRoleEndpoints(config, role);
+  if (!eps.vision) return "";
+
+  const p = mediaPathFor(file);
+  if (!p || !fs.existsSync(p)) return "";
+
+  try {
+    const base64 = fs.readFileSync(p).toString("base64");
+    const note = String(
+      await describeImage(eps.vision, eps.visionPrompt, {
+        base64,
+        mimeType: mimeForExt(path.extname(p)),
+        name: file,
+      })
+    ).trim();
+    if (!note) return "";
+    if (isStory) updateStory(owner, item.id, { visionNote: note });
+    else updatePost(owner, item.id, { visionNote: note });
+    logInfo(SCOPE, `识了一次图（${owner} 的${isStory ? "快拍" : "帖子"}），结果存下来给后面的角色共用`);
+    return note;
+  } catch (e) {
+    logWarn(SCOPE, "识图失败，这一轮按图片描述说话", e);
+    return "";
+  }
+}
+
+/* ================= 发布 ================= */
+
+/**
+ * 本地存好之后，看要不要往**真** Instagram 上也发一份。
+ *
+ * ── 为什么是动态 import ──
+ *
+ * igreal.js 要 import igrun.js（拉回来的帖子和评论得走 schedulePublish /
+ * scheduleComment 触发角色），静态互相 import 就是循环依赖。动态 import 的
+ * 代价只有第一次那点解析时间，而这条路径本来就要等网络。
+ *
+ * ── 为什么吞掉所有异常 ──
+ *
+ * 本地那条已经落盘了、上下文那几行也要照写。真 IG 发不出去是**预期内**的
+ * 常态（没绑号、没配图床、网络断了、Meta 限流），把它变成异常会让整个私聊
+ * 那一轮挂掉 —— 用户丢的是一条消息，换来的只是一条本来就在日志里的错误。
+ * 失败的原因已经写进了 `remote.error`，界面上看得见，下一轮轮询也会补发。
+ */
+async function syncToReal(config, owner, item, isStory) {
+  try {
+    const { syncOut } = await import("./igreal.js");
+    await syncOut(config, owner, item, { isStory });
+  } catch (e) {
+    logWarn(SCOPE, `${owner} 这条没能同步到真 Instagram（本地已经存好了）`, e);
+  }
+}
+
+/**
+ * 把 `splitIg` 的产物真的发出去。
+ *
+ * 私聊那一轮（角色自己写了 `[post:…]`）和主动发帖那一轮共用这里。
+ * 发完顺手给刷得到的人排队 —— 角色发的帖子也该有人来评论。
+ *
+ * 绑了真号、开了 `syncReal` 的角色还会多走一步真发布（`syncToReal`）——
+ * 那一步失败**不影响**这里的返回值：本地永远是主本。
+ *
+ * @returns {Promise<{posts:object[], stories:object[]}>} 真的落盘了的那些
+ */
+export async function publishIgTags(config, role, parsed, opts = {}) {
+  const owner = String(role?.name ?? "");
+  const out = { posts: [], stories: [] };
+  if (!owner) return out;
+
+  const make = async (draft, isStory) => {
+    const images = [];
+    for (const im of draft.images ?? []) {
+      images.push({ file: await renderImage(config, im.alt), alt: String(im.alt ?? "") });
+    }
+    // 一条什么都没有的（配文空、图也没描述）不落盘，那是模型空转
+    if (!String(draft.caption ?? "").trim() && !images.length) return null;
+
+    if (isStory) {
+      const story = addStory(owner, { caption: draft.caption, image: images[0] ?? { file: "", alt: "" } });
+      schedulePublish(config, owner, story, { isStory: true, now: opts.now, roll: opts.roll });
+      await syncToReal(config, owner, story, true);
+      out.stories.push(story);
+      return story;
+    }
+    const post = addPost(owner, { caption: draft.caption, images });
+    schedulePublish(config, owner, post, { isStory: false, now: opts.now, roll: opts.roll });
+    await syncToReal(config, owner, post, false);
+    out.posts.push(post);
+    return post;
+  };
+
+  for (const draft of parsed?.posts ?? []) await make(draft, false);
+  for (const draft of parsed?.stories ?? []) await make(draft, true);
+
+  if (parsed?.comments?.length) {
+    // 私聊那一轮不该冒出评论 —— 预设里没教过 [comment:]（用户定的：只在
+    // 被叫起来评论的那一刻才交代格式）。冒出来就是模型自己脑补的，丢掉
+    logInfo(SCOPE, `${owner} 在私聊里写了 ${parsed.comments.length} 条评论标签，没有对应的帖子，丢掉`);
+  }
+  return out;
+}
+
+/**
+ * 发布完之后，写进上下文的那几行。
+ *
+ * 帖子已经落到 data/instagram/ 了，历史里再留一份 `[post:…]` 原文只会让模型
+ * 下一轮跟着复读格式（igtags.js:stripIgTags 的注释是同一个道理）。所以换成
+ * 一句人话的陈述，模型知道「我发过这个」就够了。
+ */
+export function publishLines(published) {
+  const lines = [];
+  const one = (item, noun) => {
+    const alt = item.images?.[0]?.alt || item.image?.alt || "";
+    const body = [item.caption, alt ? `（配图：${alt}）` : ""].filter(Boolean).join(" ");
+    lines.push(`[Instagram ${noun}] ${body || "（没配文字）"}`);
+  };
+  for (const p of published?.posts ?? []) one(p, "帖子");
+  for (const s of published?.stories ?? []) one(s, "快拍");
+  return lines;
+}
+
+/**
+ * 主动消息那一轮缀在提示词末尾的那段「你也可以顺手发条 Instagram」。
+ *
+ * **两道闸都要开**：`instagram.enabled` 只代表「这个角色注册了 IG」（会点赞、
+ * 会回评论），`autoPublish` 才是「它自己会想发点什么」—— config.js:736 那条
+ * 注释定的分工。只开第一道的角色永远不会主动发帖。
+ *
+ * 为什么挂在主动消息上、而不是自己起一路定时器：角色想发条动态和角色想找人
+ * 说话，本来就是同一件事的两种出口 —— 都是「这会儿它有话想说」。共用那套
+ * 等待窗口、勿扰时段和冷却，用户调一处就够了，也不会出现「勿扰时间里不发
+ * 短信、但照样在发帖」这种说不通的事。所以 autoPublish 实际上还隐含一个
+ * 前提：`proactive.enabled` 也得开着，不然这一轮压根不会被叫起来。
+ *
+ * 发不发、发帖还是发快拍，全交给模型自己决定 —— 模板写的是「你现在想发点
+ * 东西」而不是「你必须发」。这一轮它只写短信、一个方括号都不带也是合法输出，
+ * igRouteFor 那边当作没发生过。
+ *
+ * @returns {string} 空串 = 这个角色这一轮没有「发帖」这个选项
+ */
+export function igComposeNote(config, role, opts = {}) {
+  if (!igOn(role) || !role?.instagram?.autoPublish) return "";
+  const templates = opts.templates ?? readSettings().promptTemplates;
+  const raw = String(templates?.compose ?? "").trim() || defaultTemplate("compose");
+  const user = opts.user ?? resolveUser(config, role);
+  return applyVars(raw, {
+    char: role?.name ?? "",
+    user: user?.name ?? "",
+    sep: config?.chat?.separator ?? "",
+  }).trim();
+}
+
+/* ================= 跑一条任务 ================= */
+
+/** 没做事的那种结果。 */
+function nothing(task, role, reason) {
+  return {
+    ok: true,
+    taskId: String(task?.id ?? ""),
+    roleId: String(role?.id ?? task?.roleId ?? ""),
+    roleName: String(role?.name ?? ""),
+    kind: String(task?.kind ?? ""),
+    action: "none",
+    reason,
+    comment: "",
+    dm: "",
+    mark: "",
+    commentLine: "",
+  };
+}
+
+/**
+ * 这条任务是「角色对角色」吗。
+ *
+ * 只看 kind，所以点赞那条出口和评论那条出口能共用它 —— 两处都要拿它去问
+ * `recordPeer` 那道闸，各写一遍迟早漂移。
+ */
+function isPeerKind(kind) {
+  return kind === "charPost" || kind === "charComment";
+}
+
+/**
+ * 「确实看到了，但这一轮没在 IG 上说话」—— 把这一轮记进上下文和记忆库。
+ *
+ * 两条路共用：掷中 likeChance 只点了个赞、以及 userComment 掷 replyChance 没中。
+ * 共同点是**没打模型**，所以 `built.vars` 这会儿不存在、vars 得自己拼（取的是
+ * 同一个来源 config.js:resolveUser，算出来的用户名和评论轮一致）。
+ *
+ * 这两条恰恰是最常走的路（likeChance 默认 45、replyChance 默认 60），以前都是
+ * 直接 return、什么都不记，后果是用户发了东西、角色看见了，私聊里却跟个没事人
+ * 一样。用户的原话：「角色明明看到点赞评论了，却在私聊里跟个没事人一样」。
+ *
+ * 记进去的三样是 recordTurn 一次写的（记忆 / 备忘录 / 日记流水共用同一份原文，
+ * 见 memoryhooks.js），所以这里不用、也不该分别去管三样。
+ *
+ * 会话是**现取**的，没有挪到 runIgTask 开头：那几条 `nothing(...)` 早退
+ * （内容被删了、快拍过期了）本来一次磁盘都不用读，提前建会话等于给每条不干活的
+ * 任务都白读一遍存档。
+ *
+ * @param {object} what 出岔子时日志里那句话（IG 上的痕迹已经留下了，不能回滚）
+ */
+async function recordSeen(
+  config,
+  role,
+  task,
+  opts,
+  { commentLine, peerName = "", quote = "", item = null, fields = {}, what }
+) {
+  const vars = { char: String(role?.name ?? ""), user: resolveUser(config, role)?.name ?? "" };
+  const outcome = {
+    ...nothing(task, role, ""),
+    ...fields,
+    mark: markFor(task.kind, vars, peerName, quote, item),
+    commentLine,
+    // 角色之间的互动照 recordPeer 那道闸走，和评论轮同一个规矩
+    record: !isPeerKind(task.kind) || role?.instagram?.recordPeer !== false,
+  };
+
+  if (outcome.record) {
+    const session = opts.session ? await opts.session(role) : null;
+    if (session?.commit) {
+      try {
+        await session.commit(outcome);
+      } catch (e) {
+        logError(SCOPE, what, e);
+      }
+    }
+  }
+  return outcome;
+}
+
+/** 一段话截到 n 字，超了加省略号。mark 是要进每一轮上下文的，不能长。 */
+function clip(text, n) {
+  const s = String(text ?? "").trim();
+  return s.length > n ? `${s.slice(0, n)}…` : s;
+}
+
+/**
+ * 帖子 / 快拍在 mark 里怎么描述。
+ *
+ * ── 为什么要有这个 ──
+ *
+ * 评论那一轮模型看得到完整快照（igprompt.js:snapshot 给了配文、识图结果、
+ * 已有评论）。但快照是**那一轮**的提示词，用完就没了；留在 iMessage 上下文里
+ * 的只有 mark 这一句。以前它是「{{user}} 发了一条新帖子，你刷到了」——
+ * 发了**什么**一个字都没有。
+ *
+ * 后果是几轮之后聊到这条帖子，模型手里只有「他发过帖」这个事实，内容全靠编。
+ * 用户报的就是这个：「聊到帖子的时候，LLM 根本就不知道用户发了啥」。
+ *
+ * ── 带什么进去 ──
+ *
+ * **配文和画面两样都带，不是二选一。** 它们是两件不同的事：配文是人自己写的
+ * 字，画面是图里有什么。一条帖子配文写「终于」、图是一张病历单，只带配文的话
+ * 模型下一轮只知道「他说了终于」，聊起来照样接不上。
+ *
+ * 缺哪样就只说有的那样，两样都没有说「没写配文也没有图」—— 把「确实什么都
+ * 没有」说出来，比留白好：留白时模型会当成信息缺失，然后自己编一个。
+ *
+ * ── 画面从哪儿来 ──
+ *
+ * `visionNote`（识图模型看着真图写的）优先，没有就退到 `alt`（当初生图用的那句
+ * 提示词）。和 igprompt.js:mediaText 同一个优先级，理由也一样：识图结果是看着
+ * 图写的，alt 只是生图时的输入。
+ *
+ * 这个退路是必需的，不是锦上添花：点赞那条路（默认 45%，最常走的一条）在
+ * `ensureVisionNote` **之前**就返回了，第一个刷到的角色手上 `visionNote` 还是
+ * 空的。只认 visionNote 的话，用户发的帖子有近一半在上下文里只剩配文。
+ *
+ * 截断分开算（配文 80、画面 60）：mark 每轮都跟着上下文走，长了会挤掉真正的
+ * 对话。画面那份是描述性长句，前半句已经够定位。
+ */
+function contentOf(item) {
+  const caption = clip(item?.caption, 80);
+  const parts = [];
+  if (caption) parts.push(`配文是「${caption}」`);
+
+  // 快拍是单张 image，帖子是 images 数组（轮播）。和 ensureVisionNote 一样
+  // 只看第一张有描述的 —— 轮播后面几张多半是同一场景的补充
+  const imgs = item?.image ? [item.image] : Array.isArray(item?.images) ? item.images : [];
+  const alt = imgs.map((im) => String(im?.alt ?? "").trim()).find(Boolean) ?? "";
+  const seen = clip(item?.visionNote, 60) || clip(alt, 60);
+  if (seen) parts.push(`画面是${seen}`);
+
+  if (!parts.length) return imgs.length ? "没写配文，图也没有描述" : "没写配文也没有图";
+  return parts.join("，");
+}
+
+/**
+ * 上下文里代替「对方发了条消息」的那一句。
+ *
+ * @param {object} [item] 这一轮的帖子 / 快拍对象，用来把内容带进去（见 contentOf）。
+ *   拿不到就退回原来那句干巴巴的话 —— 少一句内容比整轮不记强
+ */
+function markFor(kind, vars, peerName, quote, item) {
+  const who = kind.startsWith("user") ? String(vars?.user ?? "") || "用户" : peerName || "对方";
+  const said = quote ? `：${clip(quote, 60)}` : "";
+  const what = item ? `，${contentOf(item)}` : "";
+  switch (kind) {
+    case "userPost":
+    case "charPost":
+      return `[Instagram] ${who} 发了一条新帖子，你刷到了${what}`;
+    case "userStory":
+      return `[Instagram] ${who} 发了一条快拍，你点开看了${what}`;
+    case "userComment":
+    case "charComment":
+      return `[Instagram] ${who} 在 Instagram 上跟你说${said || "了句话"}`;
+    default:
+      return `[Instagram] ${who} 那边有了新动静`;
+  }
+}
+
+/** 给 `owner` 的东西点个赞（帖子和快拍共用）。 */
+function like(owner, item, isStory, actor) {
+  const likes = [...(item.likes ?? []), actor];
+  if (isStory) updateStory(owner, item.id, { likes });
+  else updatePost(owner, item.id, { likes });
+}
+
+/**
+ * 这条刚落盘的评论，要不要也发到真 Instagram 上。
+ *
+ * 分三种走法，难度天差地别：
+ *
+ *   自己帖子下回一条真评论   `POST /{comment-id}/replies` —— 最稳，权限天然具备
+ *   别人（角色）的帖子       要帖主先铺一条 @ 当通行证，见 igreal.js:peerComment
+ *                            2026-09-13 实测通了，失败就只留本地
+ *   用户的帖子              只有**你在配文里 @ 了这个角色**才发，见下
+ *
+ * ── 用户的帖子那一条 ──
+ *
+ * 我们没有用户帖子的写权限（那是他的号），所以默认只留本地。唯一的例外是
+ * Meta 留的那个后门：**被 @ 的人可以进来说话**。你在自己帖子的配文里写一句
+ * `@角色的用户名`，那个角色就能用自己的 token 打 `/mentions` 进来评论 ——
+ * 作者显示的是**角色自己**，不是你代发。判断和发送都在
+ * igreal.js:commentOnUserPost 里，配文里没 @ 的话它自己就返回了，不打网络。
+ *
+ * 没 @ 的帖子行为一个字没变：角色照常刷到、照常在本地评论，真 IG 上没有。
+ *
+ * 快拍一律不发：真 IG 的快拍回复走私信通道，不是评论；而且快拍的 @ 提及
+ * Mentions API 明确不支持。
+ *
+ * 和 `syncToReal` 一样吞掉所有异常 —— 本地那条已经存好了。
+ */
+async function commentToReal(config, owner, actor, item, comment, target, isStory) {
+  if (isStory) return;
+  try {
+    const { commentOnUserPost, peerComment, replyOut } = await import("./igreal.js");
+    if (owner === USER_OWNER) {
+      // 靠配文里那句 @ 进门。没 @ 的话这个函数不打网络就返回了
+      await commentOnUserPost(config, actor, item, comment.text);
+      return;
+    }
+    // 回的是一条从真 IG 拉回来的评论 → 用 replies 接口，权限天然具备
+    const parentRemote = target?.remote?.mediaId ?? "";
+    if (parentRemote && owner === actor) {
+      await replyOut(config, actor, parentRemote, comment.text);
+      return;
+    }
+    // 在**别的角色**的帖子下说话 → 得走铺路 @ 那条路
+    if (owner !== actor) await peerComment(config, owner, actor, item, comment.text);
+  } catch (e) {
+    logWarn(SCOPE, `${actor} 这条评论没能同步到真 Instagram（本地已经存好了）`, e);
+  }
+}
+
+/**
+ * 跑一条到点的任务。
+ *
+ * **不负责发短信、也不负责写上下文** —— 那两样都要 runner，由 `opts.session`
+ * 提供的 `commit` 回调去做。这里只做三件事：掷骰子、打模型、把 IG 上的痕迹
+ * （赞 / 评论 / 动态记录）落盘。
+ *
+ * @param {object} config 完整配置
+ * @param {object} task igstore.js:readQueue 里的一条
+ * @param {object} [opts] {now?, roll?, session?} session(role) → {history, commit}
+ * @returns {Promise<object>} 见 `nothing` 的字段表
+ */
+export async function runIgTask(config, task, opts = {}) {
+  // 刷 IG 那一轮是另一套流程（整张 feed、多个动作），见下面 runBrowse
+  if (task?.kind === "browse") return runBrowse(config, task, opts);
+
+  const now = Number.isFinite(opts.now) ? opts.now : Date.now();
+  const roll = opts.roll ?? Math.random;
+  const settings = readSettings();
+  const hours = settings.storyHours ?? DEFAULT_STORY_HOURS;
+
+  const role = roleById(config, task?.roleId);
+  if (!igOn(role)) return nothing(task, role, "这个角色没了，或者 Instagram 已经关掉");
+
+  const owner = String(task.postOwner ?? "");
+  const isStory = Boolean(task.storyId);
+  const item = isStory
+    ? readStories(owner).find((s) => s.id === task.storyId)
+    : readPosts(owner).find((p) => p.id === task.postId);
+  if (!item) return nothing(task, role, "那条内容已经被删了");
+  if (isStory && storyExpired(item, hours, now)) return nothing(task, role, "快拍已经过期了");
+
+  const ig = role.instagram;
+  const self = String(role.name ?? "");
+  const isReply = task.kind === "userComment" || task.kind === "charComment";
+  const list = (isStory ? item.replies : item.comments) ?? [];
+
+  /** 要回的那条评论（只有 reply 类任务有）。 */
+  let target = null;
+
+  if (isReply) {
+    target = list.find((c) => c.id === task.commentId);
+    if (!target) return nothing(task, role, "那条评论已经被删了");
+    // 同一条评论可能既排了这条任务、又在刷 IG 时被刷到回过了 —— 回过就不再回
+    if (list.some((c) => c.replyTo === target.id && c.owner === self)) {
+      return nothing(task, role, "这条已经回过了");
+    }
+    if (task.kind === "userComment" && !hit(ig.replyChance ?? 60, roll)) {
+      /*
+       * 掷 replyChance 没中 —— 语义是「**看到了，没回**」，不是「没看到」。
+       *
+       * 所以这一轮照样进上下文和记忆库。这里丢掉的东西比点赞那条更要紧：
+       * 那是**用户主动说的一句话**，吞掉之后角色下一轮在私聊里压根不知道
+       * 你在 IG 上留过言。
+       *
+       * 只有「不回」这一层是概率决定的，「知不知道」不该跟着掷骰子。
+       *
+       * 引文进 mark（markFor 里超过 60 字会截断），这样模型看到的是「她说了
+       * 什么」而不是干巴巴一句「她留了言」—— 下一轮私聊里才接得上话。
+       */
+      return recordSeen(config, role, task, opts, {
+        fields: { action: "skip", reason: "按概率这次不回" },
+        peerName: String(target?.owner ?? ""),
+        quote: target?.text ?? "",
+        commentLine: "[Instagram] 你看到了这条留言，没有回",
+        what: `${self} 这条「看到没回」没落到上下文里`,
+      });
+    }
+    if (task.kind === "charComment" && !isStory) {
+      // 排队那会儿算过一次，但中间可能又来了几条 —— 到点再算一次才准
+      const max = (roleFor(config, owner) ?? role)?.instagram?.maxChain;
+      if (!canChain(item, rootOf(list, target.id), max)) {
+        return nothing(task, role, "这条线程已经聊够了");
+      }
+    }
+  } else if (
+    !(item.likes ?? []).includes(self) &&
+    // 配文里点了名就不掷这一掷 —— 你 @ 它是要它说话，不是要它点赞
+    !mentionsRole(item, role) &&
+    hit(ig.likeChance ?? 45, roll)
+  ) {
+    // 刷到新东西先掷点赞。中了就到此为止，不打模型
+    like(owner, item, isStory, self);
+    if (owner === USER_OWNER) {
+      addActivity({
+        kind: isStory ? "storyLike" : "like",
+        actor: self,
+        target: { owner, postId: task.postId, storyId: task.storyId },
+        at: new Date(now).toISOString(),
+      });
+    }
+
+    /*
+     * 点赞**也要进上下文和待总结**（理由和实现都在 recordSeen 上面）。
+     *
+     * 助手那侧必须有字：commitIgTurn 那边 `if (!assistant) return` 会把两边
+     * 都空的轮次整个丢掉（见 imessage.js），所以 commentLine 写成一句人话。
+     */
+    return recordSeen(config, role, task, opts, {
+      fields: { action: "like" },
+      peerName: task.kind === "charPost" ? owner : "",
+      // 内容要带进 mark：这条路是**最常走**的一条（默认 45% 只点赞不打模型），
+      // 它不带内容的话，用户发的大半帖子在上下文里都只剩「他发过帖」
+      item,
+      commentLine: isStory
+        ? "[Instagram] 你给这条快拍点了个赞"
+        : "[Instagram] 你给这条帖子点了个赞",
+      what: `${self} 点赞这一轮的上下文没落下去（赞已经点了）`,
+    });
+  }
+
+  // ── 到这儿才轮到模型 ──
+
+  await ensureVisionNote(config, role, owner, item, isStory);
+  const fresh = isStory
+    ? readStories(owner).find((s) => s.id === item.id) ?? item
+    : readPosts(owner).find((p) => p.id === item.id) ?? item;
+
+  const session = opts.session ? await opts.session(role) : null;
+  if (!session) {
+    logWarn(SCOPE, `${self} 现在没有可用的会话，这一轮照跑，但上文是空的、短信发不出去`);
+  }
+
+  const peerName =
+    task.kind === "charComment" ? String(target?.owner ?? "") : task.kind === "charPost" ? owner : "";
+
+  const built = await buildIgPrompt(
+    config,
+    role,
+    {
+      kind: task.kind,
+      owner,
+      post: isStory ? null : fresh,
+      story: isStory ? fresh : null,
+      commentId: task.commentId || "",
+      peerName,
+      // 配文里点名了就在快照里说一句，免得模型当成一条普通帖子随口评
+      mentioned: mentionsRole(fresh, role),
+    },
+    { history: session?.history ?? [], now, templates: settings.promptTemplates }
+  );
+
+  const eps = resolveRoleEndpoints(config, role);
+  const { content } = await chatWithFallback(eps.chat, eps.fallback, built.messages, built.params);
+
+  const parsed = splitIg(content, config?.chat?.separator ?? "");
+  if (parsed.comments.length > 1) {
+    logInfo(SCOPE, `${self} 这一轮写了 ${parsed.comments.length} 条评论，只发第一条`);
+  }
+  if (parsed.posts.length || parsed.stories.length) {
+    // 评论轮里冒出帖子是模型跑偏（三条模板里每条都写了「这一轮不发帖」）
+    logInfo(SCOPE, `${self} 在评论轮里想发帖 / 发快拍，不照做`);
+  }
+
+  const text = String(parsed.comments[0] ?? "").trim();
+  const isPeer = isPeerKind(task.kind);
+  let dm = isPeer ? "" : String(parsed.rest ?? "").trim();
+  if (isPeer && parsed.rest?.trim()) {
+    // 角色之间的互动按用户定的规矩**不触发 iMessage 回复**
+    logInfo(SCOPE, `${self} 冲着 ${peerName} 那轮还写了段私聊，按规矩不发`);
+  }
+  if (dm && !session) {
+    logWarn(SCOPE, `${self} 这一轮想给用户发条短信，但没有可用的会话，只好丢掉`);
+    dm = "";
+  }
+
+  if (!text && !dm) return nothing(task, role, "模型这一轮什么都没说");
+
+  // ── 评论落盘 ──
+  let saved = null;
+  if (text) {
+    const entry = { owner: self, text, replyTo: isReply ? String(task.commentId) : "" };
+    const next = [...list, entry];
+    const after = isStory
+      ? updateStory(owner, item.id, { replies: next })
+      : updatePost(owner, item.id, { comments: next });
+    saved = ((isStory ? after?.replies : after?.comments) ?? []).at(-1) ?? null;
+
+    if (owner === USER_OWNER || (isReply && target?.owner === USER_OWNER)) {
+      addActivity({
+        kind: isStory ? "storyReply" : isReply ? "reply" : "comment",
+        actor: self,
+        target: {
+          owner,
+          postId: task.postId,
+          storyId: task.storyId,
+          commentId: saved?.id ?? "",
+        },
+        text,
+        at: new Date(now).toISOString(),
+      });
+    }
+
+    // 角色之间的来回：这条评论也可能把对面叫起来
+    if (saved) {
+      scheduleComment(config, owner, after ?? fresh, saved, {
+        isStory,
+        now,
+        roll,
+        chain: (Number(task.chain) || 0) + 1,
+      });
+      await commentToReal(config, owner, self, after ?? fresh, saved, target, isStory);
+    }
+  }
+
+  const outcome = {
+    ok: true,
+    taskId: String(task.id ?? ""),
+    roleId: String(role.id ?? ""),
+    roleName: self,
+    kind: String(task.kind ?? ""),
+    action: text ? "comment" : "dm",
+    reason: "",
+    comment: text,
+    commentId: saved?.id ?? "",
+    dm,
+    // 传 fresh（识图之后重读的那份）而不是 item —— visionNote 是
+    // ensureVisionNote 刚写进去的，item 那份还是识图前的旧快照
+    mark: markFor(task.kind, built.vars, peerName, isReply ? target?.text ?? "" : "", fresh),
+    commentLine: text ? `[Instagram 评论] ${text}` : "",
+    // 角色间的互动要不要让模型知道。关了就只在 IG 上留个痕，不进上下文、
+    // 也不进待总结 —— 用户那边一个字都看不见，本来也不该替他攒记忆
+    record: !isPeer || ig.recordPeer !== false,
+  };
+
+  // 写上下文 + 发短信。出岔子不该把已经发出去的评论回滚掉（IG 上那条是真的
+  // 已经发了），所以吞掉异常、只记一条日志
+  if (outcome.record && session?.commit) {
+    try {
+      await session.commit(outcome);
+    } catch (e) {
+      logError(SCOPE, `${self} 这一轮的上下文 / 短信没落下去（IG 上的评论已经发了）`, e);
+    }
+  }
+  return outcome;
+}
+
+/* ================= 刷 IG ================= */
+
+/*
+ * 「刷 IG」：每个开了 IG 的角色隔一段随机时间自己打开 Instagram 刷一圈。
+ *
+ * ── 为什么要有这一路 ──
+ *
+ * 上面那套任务全是**事件触发**的：有人发了帖 → 每个刷得到的角色排一条；
+ * 有人评论了谁 → 被说话的那个排一条。一条任务只看一条内容、只留一句评论，
+ * 而且目标是用户的评论压根不排（scheduleComment 里那句 `targetOwner === USER_OWNER`）。
+ * 后果就是用户报的「角色间的互动太少」：A 在你帖子下面评论了一句，B 永远
+ * 不会看见 —— 没有任何事件会把 B 叫到那条帖子底下去。
+ *
+ * 这一路补的就是「刷」这个动作：到点了，把最近的帖子、活着的快拍、每条下面
+ * 谁赞了谁说了什么，整张摆给它，让它自己挑着赞、评、回。回了谁，谁就照旧
+ * 被 scheduleComment 叫起来接话 —— 两路是接得上的。
+ *
+ * ── 怎么定时 ──
+ *
+ * 不另起定时器，**挂在互动队列上**：每个角色队列里常驻一条 `kind: "browse"`，
+ * 跑完自己排下一条（ensureBrowseTasks 负责「没有就补一条」）。好处是跨重启
+ * 自然有效（队列是落盘的），`/立即触发评论` 也顺带能让大家马上刷一次。
+ *
+ * ── 省钱的三道闸 ──
+ *
+ *   1. 勿扰时段不刷（跟这个角色主动消息那份 focus），推到勿扰结束之后。
+ *   2. 上次刷完之后**一点新动静都没有**（没有别人的新帖、新快拍、新评论）就
+ *      不打模型，直接排下一次。
+ *   3. 一轮最多 12 个赞、5 条评论，同一条内容下最多 2 条 —— 模型再兴奋也刷不了屏。
+ *
+ * **不碰真 IG**：这一轮的赞和评论只落在本地（data/instagram/）。
+ */
+
+/** 回看多久以内的帖子。更早的帖子就算有新评论也不摆出来 —— 那是翻旧账了。 */
+const BROWSE_LOOKBACK_MS = 3 * 24 * 3600_000;
+const BROWSE_MAX_POSTS = 8;
+const BROWSE_MAX_STORIES = 5;
+const BROWSE_MAX_LIKES = 12;
+const BROWSE_MAX_COMMENTS = 5;
+const BROWSE_MAX_PER_ITEM = 2;
+/** 一轮最多给几张图补识图。识图有缓存（visionNote），但第一次还是要花钱。 */
+const BROWSE_MAX_VISION = 3;
+
+function browseOn(role) {
+  return igOn(role) && role?.instagram?.browse?.enabled !== false;
+}
+
+/** 下一次刷在什么时候：刷 IG 那个窗口里随机挑一个点。 */
+export function browseDelay(role, now = Date.now(), roll = Math.random) {
+  const w = role?.instagram?.browse ?? {};
+  const a = Number(w.minMinutes) > 0 ? Number(w.minMinutes) : 60;
+  const b = Number(w.maxMinutes) > 0 ? Number(w.maxMinutes) : 180;
+  const lo = Math.min(a, b);
+  const hi = Math.max(a, b);
+  return now + Math.round((lo + roll() * (hi - lo)) * 60_000);
+}
+
+function pushBrowse(role, at, since) {
+  return pushQueue({
+    at,
+    roleId: String(role.id ?? ""),
+    kind: "browse",
+    postOwner: "",
+    postId: "",
+    storyId: "",
+    commentId: "",
+    chain: 0,
+    since: Number(since) || 0,
+  });
+}
+
+/**
+ * 每个该刷 IG 的角色，队列里都得有且只有一条 browse 任务。缺的补上。
+ *
+ * 第一次排的那条 `since` 记成一天前：刚开这个功能时，最近一天里的东西都算「新」，
+ * 角色第一次刷就有东西可看，而不是先空跑一轮。
+ */
+export function ensureBrowseTasks(config, now = Date.now(), roll = Math.random) {
+  const has = new Set(readQueue().filter((t) => t.kind === "browse").map((t) => t.roleId));
+  const out = [];
+  for (const role of config?.roles ?? []) {
+    if (!browseOn(role) || has.has(String(role.id ?? ""))) continue;
+    out.push(pushBrowse(role, browseDelay(role, now, roll), now - 24 * 3600_000));
+  }
+  return out;
+}
+
+/** 一条内容最近一次有动静是什么时候（发出来 / 最后一条评论）。 */
+function lastActivity(item, isStory) {
+  const list = (isStory ? item.replies : item.comments) ?? [];
+  let at = Date.parse(item.createdAt ?? "") || 0;
+  for (const c of list) at = Math.max(at, Date.parse(c?.at ?? "") || 0);
+  return at;
+}
+
+/** 这条内容下面有没有**别人**说的话（自己的帖子只有这种才值得摆出来）。 */
+function othersTalked(item, isStory, self) {
+  return ((isStory ? item.replies : item.comments) ?? []).some((c) => c?.owner && c.owner !== self);
+}
+
+/**
+ * 这个角色这一圈刷得到什么。
+ *
+ * 看得到谁：用户（主角，不受白名单管）、自己（回自己帖子下的评论）、以及自己
+ * 互动名单里的角色 —— 和 audienceFor 同一个单向口径。
+ *
+ * 帖子按「最近一次有动静」倒序，不按发帖时间：一条两天前的帖子刚有人评论，
+ * 比一条昨天发的、谁都没理的帖子更该被刷到。
+ *
+ * @returns {{ref:string,isStory:boolean,owner:string,item:object}[]}
+ */
+export function buildBrowseFeed(config, role, now = Date.now(), hours = DEFAULT_STORY_HOURS) {
+  const self = String(role?.name ?? "");
+  const owners = [USER_OWNER, self];
+  for (const r of config?.roles ?? []) {
+    const name = String(r?.name ?? "");
+    if (!igOn(r) || !name || name === self) continue;
+    if (peerAllowed(config, role, name)) owners.push(name);
+  }
+
+  const posts = [];
+  const stories = [];
+  for (const owner of owners) {
+    for (const p of readPosts(owner)) {
+      const at = lastActivity(p, false);
+      if (now - at > BROWSE_LOOKBACK_MS) continue;
+      if (owner === self && !othersTalked(p, false, self)) continue;
+      posts.push({ owner, item: p, at });
+    }
+    for (const s of activeStories(owner, hours, now)) {
+      if (owner === self && !othersTalked(s, true, self)) continue;
+      stories.push({ owner, item: s, at: lastActivity(s, true) });
+    }
+  }
+  posts.sort((a, b) => b.at - a.at);
+  stories.sort((a, b) => b.at - a.at);
+
+  return [
+    ...posts.slice(0, BROWSE_MAX_POSTS).map((p, i) => ({ ref: `P${i + 1}`, isStory: false, owner: p.owner, item: p.item })),
+    ...stories
+      .slice(0, BROWSE_MAX_STORIES)
+      .map((s, i) => ({ ref: `S${i + 1}`, isStory: true, owner: s.owner, item: s.item })),
+  ];
+}
+
+/** 这条内容里，`since` 之后**别人**弄出来的新东西：它本身是新的，或者有新评论。 */
+function newsOf(entry, since, self) {
+  const { item, isStory, owner } = entry;
+  const created = Date.parse(item.createdAt ?? "") || 0;
+  const list = (isStory ? item.replies : item.comments) ?? [];
+  return {
+    fresh: owner !== self && created > since,
+    comments: list.filter((c) => c?.owner !== self && (Date.parse(c?.at ?? "") || 0) > since),
+  };
+}
+
+/** 上次刷完之后有没有任何新动静。一点都没有就不打模型。 */
+export function feedHasNews(feed, since, self) {
+  return (feed ?? []).some((e) => {
+    const n = newsOf(e, since, self);
+    return n.fresh || n.comments.length > 0;
+  });
+}
+
+/** 「Dante 的帖子」「你的快拍」「{{user}} 的帖子」。 */
+function itemLabel(entry, vars, self) {
+  const who =
+    entry.owner === self
+      ? "你"
+      : entry.owner === USER_OWNER
+        ? String(vars?.user ?? "") || "用户"
+        : entry.owner;
+  return `${who}的${entry.isStory ? "快拍" : "帖子"}`;
+}
+
+function nameOf(owner, vars, self) {
+  if (owner === self) return "你";
+  if (owner === USER_OWNER) return String(vars?.user ?? "") || "用户";
+  return String(owner ?? "");
+}
+
+/**
+ * 刷完这一圈之后，写进上下文 user 那侧的一句旁白：**别人**这段时间在 IG 上干了什么。
+ *
+ * 这是用户要的「上下文也要有他们互动的显示」—— 以前角色之间的来往只在
+ * 各自那一条评论里留痕，第三个角色的上下文里一个字都没有。
+ *
+ * 只写新的（since 之后的），每条内容最多 4 条评论、最多 5 条内容；
+ * 这句话每轮都跟着上下文走，太长会挤掉真正的对话。
+ */
+export function browseMark(feed, since, vars, self) {
+  const rows = [];
+  for (const e of feed ?? []) {
+    const n = newsOf(e, since, self);
+    const touched = new Set(e.touched ?? []);
+    if (!n.fresh && !n.comments.length && !touched.size) continue;
+    const list = (e.isStory ? e.item.replies : e.item.comments) ?? [];
+    const byId = new Map(list.map((c) => [c.id, c]));
+    const bits = [];
+    if (n.fresh || touched.has("item")) bits.push(contentOf(e.item));
+    for (const c of n.comments.slice(-4)) {
+      const to = c.replyTo ? byId.get(c.replyTo) : null;
+      const head = to
+        ? `${nameOf(c.owner, vars, self)} 回复 ${nameOf(to.owner, vars, self)}`
+        : `${nameOf(c.owner, vars, self)} 说`;
+      bits.push(`${head}「${clip(c.text, 40)}」`);
+    }
+    const likes = (e.item.likes ?? []).filter((o) => o && o !== self);
+    if (likes.length) bits.push(`${likes.map((o) => nameOf(o, vars, self)).join("、")} 赞了`);
+    rows.push(`· ${itemLabel(e, vars, self)}：${bits.join("；") || "没什么新的"}`);
+    if (rows.length >= 5) break;
+  }
+  if (!rows.length) return "[Instagram] 你刷了会儿 Instagram，没什么新动静";
+  return ["[Instagram] 你刷了会儿 Instagram，看到：", ...rows].join("\n");
+}
+
+/**
+ * 编号 → 这一轮 feed 里的哪条内容 / 哪条评论。对不上返回 null。
+ * 评论编号是 1 起的，和 igprompt.js:commentText 印出来的一致。
+ */
+function resolveRef(feed, ref) {
+  const [head, sub] = String(ref ?? "").split("-");
+  const entry = (feed ?? []).find((e) => e.ref === head);
+  if (!entry) return null;
+  if (!sub) return { entry, comment: null };
+  const list = (entry.isStory ? entry.item.replies : entry.item.comments) ?? [];
+  const comment = list[Number(sub) - 1];
+  return comment ? { entry, comment } : null;
+}
+
+/** 重读一遍这条内容（同一轮里前一个动作可能已经改过它）。 */
+function reread(entry) {
+  const fresh = entry.isStory
+    ? readStories(entry.owner).find((s) => s.id === entry.item.id)
+    : readPosts(entry.owner).find((p) => p.id === entry.item.id);
+  return fresh ?? null;
+}
+
+/**
+ * 跑一轮刷 IG。runIgTask 看到 `kind: "browse"` 就转到这里。
+ *
+ * 不管这一轮做没做事，**最后都排下一次**（除非这个角色把刷 IG 关了 ——
+ * 那就让这条链断掉，重新打开时 ensureBrowseTasks 会补上）。
+ */
+export async function runBrowse(config, task, opts = {}) {
+  const now = Number.isFinite(opts.now) ? opts.now : Date.now();
+  const roll = opts.roll ?? Math.random;
+  const settings = readSettings();
+  const hours = settings.storyHours ?? DEFAULT_STORY_HOURS;
+
+  const role = roleById(config, task?.roleId);
+  if (!browseOn(role)) return nothing(task, role, "这个角色没开 Instagram 或者没开刷 IG");
+
+  const since = Number(task.since) || now - 24 * 3600_000;
+  const self = String(role.name ?? "");
+
+  // 勿扰：推到勿扰结束之后再随机等一小会儿，since 不动（这段时间的新东西留到那时候看）
+  const focus = role?.proactive?.focus;
+  if (inFocus(focus, new Date(now))) {
+    const at = now + msUntilFocusEnd(focus, new Date(now)) + Math.round(roll() * 30 * 60_000);
+    pushBrowse(role, at, since);
+    return nothing(task, role, "勿扰时段，晚点再刷");
+  }
+
+  let feed = buildBrowseFeed(config, role, now, hours);
+  if (!feedHasNews(feed, since, self)) {
+    pushBrowse(role, browseDelay(role, now, roll), now);
+    return nothing(task, role, "上次刷完之后没有新动静，这一轮不打模型");
+  }
+
+  // 排下一次放在打模型之前：模型那一步挂了也不能让这条链断掉
+  pushBrowse(role, browseDelay(role, now, roll), now);
+
+  // 新内容补一次识图（有缓存，同一张图全局只识一次）
+  let vision = 0;
+  for (const e of feed) {
+    if (vision >= BROWSE_MAX_VISION) break;
+    if (e.item.visionNote || !newsOf(e, since, self).fresh) continue;
+    const hasFile = e.isStory ? e.item.image?.file : (e.item.images ?? []).some((im) => im.file);
+    if (!hasFile) continue;
+    vision += 1;
+    await ensureVisionNote(config, role, e.owner, e.item, e.isStory);
+  }
+  if (vision) feed = feed.map((e) => ({ ...e, item: reread(e) ?? e.item }));
+
+  const session = opts.session ? await opts.session(role) : null;
+  const built = await buildIgPrompt(
+    config,
+    role,
+    { kind: "browse", owner: "", feed, since },
+    { history: session?.history ?? [], now, templates: settings.promptTemplates }
+  );
+  const vars = built.vars;
+
+  const eps = resolveRoleEndpoints(config, role);
+  const { content } = await chatWithFallback(eps.chat, eps.fallback, built.messages, built.params);
+  const parsed = splitBrowse(content, config?.chat?.separator ?? "");
+
+  const done = []; // 给 commentLine 用的人话
+  const at = new Date(now).toISOString();
+  let involvesUser = feed.some((e) => {
+    const n = newsOf(e, since, self);
+    return (n.fresh || n.comments.length) && (e.owner === USER_OWNER || n.comments.some((c) => c.owner === USER_OWNER));
+  });
+
+  // ── 点赞 ──
+  for (const ref of parsed.likes.slice(0, BROWSE_MAX_LIKES)) {
+    const hitRef = resolveRef(feed, ref);
+    if (!hitRef) {
+      logInfo(SCOPE, `${self} 刷 IG 时点赞了一个不存在的编号 ${ref}，跳过`);
+      continue;
+    }
+    const { entry, comment } = hitRef;
+    const item = reread(entry);
+    if (!item) continue;
+    if (!comment) {
+      if (entry.owner === self || (item.likes ?? []).includes(self)) continue;
+      like(entry.owner, item, entry.isStory, self);
+      if (entry.owner === USER_OWNER) {
+        involvesUser = true;
+        addActivity({
+          kind: entry.isStory ? "storyLike" : "like",
+          actor: self,
+          target: { owner: entry.owner, postId: entry.isStory ? "" : item.id, storyId: entry.isStory ? item.id : "" },
+          at,
+        });
+      }
+      done.push(`赞了${itemLabel(entry, vars, self)}`);
+      continue;
+    }
+    // 给评论点赞
+    const listKey = entry.isStory ? "replies" : "comments";
+    const list = item[listKey] ?? [];
+    const c = list.find((x) => x.id === comment.id);
+    if (!c || c.owner === self || (c.likes ?? []).includes(self)) continue;
+    const next = list.map((x) => (x.id === c.id ? { ...x, likes: [...(x.likes ?? []), self] } : x));
+    if (entry.isStory) updateStory(entry.owner, item.id, { replies: next });
+    else updatePost(entry.owner, item.id, { comments: next });
+    if (c.owner === USER_OWNER) {
+      involvesUser = true;
+      addActivity({
+        kind: "commentLike",
+        actor: self,
+        target: {
+          owner: entry.owner,
+          postId: entry.isStory ? "" : item.id,
+          storyId: entry.isStory ? item.id : "",
+          commentId: c.id,
+        },
+        at,
+      });
+    }
+    done.push(`赞了 ${nameOf(c.owner, vars, self)} 在${itemLabel(entry, vars, self)}下的评论`);
+  }
+
+  // ── 评论 / 回复 ──
+  const perItem = new Map();
+  let commented = 0;
+  for (const { ref, text } of parsed.comments) {
+    if (commented >= BROWSE_MAX_COMMENTS) break;
+    const hitRef = resolveRef(feed, ref);
+    if (!hitRef) {
+      logInfo(SCOPE, `${self} 刷 IG 时评论了一个不存在的编号 ${ref}，跳过`);
+      continue;
+    }
+    const { entry, comment: target } = hitRef;
+    const key = `${entry.owner}/${entry.item.id}`;
+    if ((perItem.get(key) ?? 0) >= BROWSE_MAX_PER_ITEM) continue;
+    if (target && target.owner === self) continue; // 不回自己
+
+    const item = reread(entry);
+    if (!item) continue;
+    const listKey = entry.isStory ? "replies" : "comments";
+    const list = item[listKey] ?? [];
+
+    // 回的是另一个角色的评论 → 守帖主的线程上限，和 scheduleComment 同一个口径
+    const targetIsRole = target && target.owner !== USER_OWNER && roleFor(config, target.owner);
+    if (targetIsRole && !entry.isStory) {
+      const max = (roleFor(config, entry.owner) ?? role)?.instagram?.maxChain;
+      if (!canChain(item, rootOf(list, target.id), max)) {
+        logInfo(SCOPE, `${self} 想回 ${target.owner}，但那条线程已经聊够了`);
+        continue;
+      }
+    }
+
+    const entryRow = { owner: self, text, at, replyTo: target ? String(target.id) : "" };
+    const after = entry.isStory
+      ? updateStory(entry.owner, item.id, { replies: [...list, entryRow] })
+      : updatePost(entry.owner, item.id, { comments: [...list, entryRow] });
+    const saved = (after?.[listKey] ?? []).at(-1) ?? null;
+    if (!saved) continue;
+    commented += 1;
+    perItem.set(key, (perItem.get(key) ?? 0) + 1);
+
+    if (entry.owner === USER_OWNER || target?.owner === USER_OWNER) {
+      involvesUser = true;
+      addActivity({
+        kind: entry.isStory ? "storyReply" : target ? "reply" : "comment",
+        actor: self,
+        target: {
+          owner: entry.owner,
+          postId: entry.isStory ? "" : item.id,
+          storyId: entry.isStory ? item.id : "",
+          commentId: saved.id,
+        },
+        text,
+        at,
+      });
+    }
+
+    // 被回的那个角色（或帖主）照旧会被叫起来接话
+    scheduleComment(config, entry.owner, after, saved, { isStory: entry.isStory, now, roll, chain: 0 });
+
+    const where = itemLabel(entry, vars, self);
+    done.push(
+      target
+        ? `在${where}下回复 ${nameOf(target.owner, vars, self)}：「${clip(text, 60)}」`
+        : entry.isStory
+          ? `回了${where}：「${clip(text, 60)}」`
+          : `在${where}下评论：「${clip(text, 60)}」`
+    );
+  }
+
+  if (!done.length && !parsed.pass) {
+    logInfo(SCOPE, `${self} 刷 IG 这一轮没写出能用的标签`, clip(content, 200));
+  }
+
+  const outcome = {
+    ...nothing(task, role, ""),
+    action: done.length ? "browse" : "none",
+    reason: done.length ? "" : "刷了一圈，没动",
+    mark: browseMark(feed, since, vars, self),
+    commentLine: done.length
+      ? `[Instagram] 你${done.join("；")}`
+      : "[Instagram] 你看了看，这次没点赞也没评论",
+    done,
+    // 牵扯到用户的一律记；纯角色之间的照 recordPeer 那道闸走
+    record: involvesUser || role.instagram?.recordPeer !== false,
+  };
+
+  if (outcome.record && session?.commit) {
+    try {
+      await session.commit(outcome);
+    } catch (e) {
+      logError(SCOPE, `${self} 刷 IG 这一轮的上下文没落下去（IG 上的赞和评论已经在了）`, e);
+    }
+  }
+  if (done.length) logInfo(SCOPE, `${self} 刷了一圈 IG：${done.join("；")}`);
+  return outcome;
+}
+
+/* ================= 定时器 ================= */
+
+/** 多久看一眼队列。和记忆库那个日记定时器同一个节奏。 */
+const TICK_MS = 60000;
+
+/**
+ * 扫一遍到点的任务。
+ *
+ * **先出队再执行**：跑挂了就当这一条没了，不会下一轮又来一次 —— 重试一条
+ * 会打模型的任务，代价是用户白花钱、IG 上还可能冒出两条一样的评论。
+ *
+ * `opts.all` 是 `/立即触发评论` 那条指令用的：不管 `at` 排在多久以后，
+ * 队列里排着的**全部**立刻跑掉。不写成「传一个未来的 now」——
+ * 同一个 now 还喂给了下面的 pruneVisionNotes，那样会把识图缓存整个清空，
+ * 下次刷到同一张图又要花一次钱重新识。
+ */
+export async function tickIgQueue(config, opts = {}) {
+  const now = Number.isFinite(opts.now) ? opts.now : Date.now();
+  const settings = readSettings();
+
+  try {
+    pruneVisionNotes(
+      igOwners(config).map((o) => o.owner),
+      settings.storyHours,
+      now
+    );
+  } catch (e) {
+    logWarn(SCOPE, "清识图缓存时出错（不影响别的）", e);
+  }
+
+  // 每个开着「定时刷 IG」的角色，队列里常驻一条 browse（没有就补上）
+  try {
+    ensureBrowseTasks(config, now);
+  } catch (e) {
+    logWarn(SCOPE, "补刷 IG 任务时出错（不影响别的）", e);
+  }
+
+  const tasks = opts.all ? readQueue().sort((a, b) => a.at - b.at) : dueTasks(now);
+  if (tasks.length) {
+    // 队列里的任务是**延后**执行的（角色刷到一条内容，掷骰子决定几分钟后
+    // 再点赞/评论），所以「到点了、开始跑」这件事以前只能从结果反推
+    logDebug(SCOPE, `${tasks.length} 条互动任务到点：${tasks.map((t) => t.kind).join("、")}`);
+  }
+  const out = [];
+  for (const task of tasks) {
+    dropQueue(task.id);
+    const t0 = Date.now();
+    try {
+      out.push(await runIgTask(config, task, opts));
+      logDebug(SCOPE, `互动任务 ${task.kind} 跑完，用了 ${Date.now() - t0}ms`);
+    } catch (e) {
+      logError(
+        SCOPE,
+        `一条互动任务跑挂了（${task.kind}，已经出队，不重试）：${String(e?.message ?? e)}`,
+        e
+      );
+    }
+  }
+  return out;
+}
+
+/**
+ * 起定时器。形状照抄 memoryhooks.js:startDiaryTimer —— unref 掉，让它不要
+ * 拖着进程不退出；返回一个停止函数给热重启用。
+ *
+ * @param {() => object} getConfig 每次 tick 现读一份配置（用户随时在改）
+ * @param {object} [opts] {session?} 见 runIgTask
+ */
+export function startIgQueue(getConfig, opts = {}) {
+  const tick = async () => {
+    const config = getConfig?.();
+    if (!config) return;
+    // 一个开着 IG 的角色都没有就别读队列了
+    if (!(config.roles ?? []).some(igOn)) return;
+    await tickIgQueue(config, opts);
+  };
+
+  const timer = setInterval(() => {
+    void tick().catch((e) => logError(SCOPE, "互动队列这一轮出错", e));
+  }, TICK_MS);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}

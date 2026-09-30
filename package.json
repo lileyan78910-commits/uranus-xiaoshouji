@@ -1,0 +1,32 @@
+{
+  "name": "uranus-xiaoshouji",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sync": "node ../scripts/sync-core.mjs",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "@photon-ai/advanced-imessage": "2.2.0",
+    "@spectrum-ts/imessage": "12.10.1",
+    "chinese-days": "^1.5.9",
+    "cors": "^2.8.6",
+    "date-holidays": "^3.36.1",
+    "express": "^4.22.3",
+    "spectrum-ts": "12.10.1"
+  },
+  "devDependencies": {
+    "wrangler": "^4.142.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "URANUS_PASSWORD": {
+        "description": "**后端密钥**。控制台连这个后端时要填它，至少 8 位、带一个大写字母。自己记好 —— 部署之后在 Cloudflare 后台只能改、看不到。"
+      },
+      "TZ": {
+        "description": "角色过日子用的时区（「现在几点」、定时日记、主动消息都按它）。国内用 `Asia/Shanghai`，美西用 `America/Los_Angeles`。"
+      }
+    }
+  }
+}
